@@ -1,0 +1,13 @@
+streamlit
+langchain
+langchain-community
+langchain-groq
+langchain-text-splitters
+langchain-huggingface
+pypdf
+docx2txt
+unstructured
+markdown
+faiss-cpu
+sentence-transformers
+pandas
