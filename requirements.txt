@@ -1,4 +1,7 @@
-streamlit
+streamlit>=1.36
+groq
+gspread
+google-auth
 langchain
 langchain-community
 langchain-groq
