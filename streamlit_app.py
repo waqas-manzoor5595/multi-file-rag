@@ -36,6 +36,7 @@ from dashboard_utils import (
     toggle_todo,
     remove_todo,
 )
+import telegram_assistant as tga
 
 LOADER_MAP = {
     ".pdf": PyPDFLoader,
@@ -57,6 +58,25 @@ Context:
 Question: {question}
 
 Answer:"""
+)
+
+COMBINED_PROMPT = ChatPromptTemplate.from_template(
+    """You are a personal assistant with access to the user's uploaded documents AND
+their current dashboard state (to-do list, timetable, and flagged important Telegram messages).
+
+Use whichever is relevant to answer the question. If it's about documents, cite the source file
+by name. If it's about todos, timetable, or messages, answer directly from the dashboard state
+below. If the answer isn't in either, say so plainly rather than guessing.
+
+Document context:
+{doc_context}
+
+Dashboard state:
+{state_context}
+
+Question: {question}
+
+Answer (keep it concise — this will be sent back as a Telegram message):"""
 )
 
 
@@ -208,6 +228,27 @@ def answer_question(vectorstore, question, api_key):
     return answer, source_docs
 
 
+def answer_unified_query(vectorstore, question, api_key, state_context):
+    """Like answer_question, but also feeds in the dashboard's current
+    to-do/timetable/important-messages state, so questions from Telegram
+    can span both documents and app state in one answer."""
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=api_key)
+
+    if vectorstore is not None:
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        source_docs = retriever.invoke(question)
+        doc_context = format_docs(source_docs)
+    else:
+        source_docs = []
+        doc_context = "(No documents indexed yet.)"
+
+    chain = COMBINED_PROMPT | llm | StrOutputParser()
+    answer = chain.invoke(
+        {"doc_context": doc_context, "state_context": state_context, "question": question}
+    )
+    return answer, source_docs
+
+
 st.set_page_config(page_title="Multi-File RAG Dashboard", page_icon="📚", layout="wide")
 
 st.markdown(
@@ -252,6 +293,10 @@ if "telegram_last_update_id" not in st.session_state:
     st.session_state.telegram_last_update_id = None
 if "telegram_keywords" not in st.session_state:
     st.session_state.telegram_keywords = "urgent, asap, important"
+if "telegram_commands" not in st.session_state:
+    st.session_state.telegram_commands = []  # log of {question, answer} pairs asked via Telegram
+if "telegram_auto_escalate" not in st.session_state:
+    st.session_state.telegram_auto_escalate = False
 
 # --- Dashboard widgets state ---
 if "timetable" not in st.session_state:
@@ -366,13 +411,16 @@ with main_col:
     st.divider()
     st.header("3. Telegram")
     st.markdown(
-        "Send messages through your Telegram bot, and pull in anything sent *to* the bot — "
-        "each incoming message is automatically sorted into **Inbox** or **Important** based "
-        "on keywords you define."
+        "Send messages through your Telegram bot, pull in anything sent *to* it, and — the "
+        "unique bit — **text the bot a question and it answers using your documents, todos, "
+        "timetable, and important messages, all sent back as a Telegram reply.**"
     )
 
     default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
+    default_priority_chat_id = st.secrets.get(
+        "TELEGRAM_PRIORITY_CHAT_ID", os.environ.get("TELEGRAM_PRIORITY_CHAT_ID", "")
+    )
 
     tg_col1, tg_col2 = st.columns(2)
     with tg_col1:
@@ -384,10 +432,19 @@ with main_col:
         )
     with tg_col2:
         chat_id = st.text_input(
-            "Chat ID",
+            "Chat ID (main route)",
             value=default_chat_id,
             help="The chat you're sending to / receiving from.",
         )
+
+    priority_chat_id = st.text_input(
+        "Priority Chat ID (optional second route)",
+        value=default_priority_chat_id,
+        help=(
+            "A second chat/channel ID to escalate to — e.g. a separate 'Alerts' chat with "
+            "your bot, or a group chat. Leave blank to only use the main chat."
+        ),
+    )
 
     keywords_input = st.text_input(
         "Important keywords (comma-separated)",
@@ -396,6 +453,12 @@ with main_col:
     )
     st.session_state.telegram_keywords = keywords_input
     important_keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+
+    st.session_state.telegram_auto_escalate = st.checkbox(
+        "Auto-escalate: when a message is classified Important, also push it to the Priority route",
+        value=st.session_state.telegram_auto_escalate,
+        help="Requires a Priority Chat ID above. Sends a second, distinct alert through that route.",
+    )
 
     st.subheader("Send a message")
     send_col1, send_col2 = st.columns([4, 1])
@@ -418,15 +481,56 @@ with main_col:
             else:
                 st.error(f"Failed to send: {info}")
 
-    st.subheader("Incoming messages")
+    st.subheader("Push a notification")
+    notify_col1, notify_col2, notify_col3 = st.columns([2, 2, 1])
+    with notify_col1:
+        notify_type = st.selectbox(
+            "Content",
+            ["Full digest", "To-do list", "Timetable", "Important messages"],
+        )
+    with notify_col2:
+        notify_route = st.selectbox(
+            "Route",
+            ["Main chat", "Priority chat"],
+            help="Priority chat requires a Priority Chat ID above.",
+        )
+    with notify_col3:
+        st.write("")
+        st.write("")
+        notify_clicked = st.button("Send notification", use_container_width=True)
+
+    if notify_clicked:
+        target = chat_id if notify_route == "Main chat" else priority_chat_id
+        if not bot_token.strip() or not target.strip():
+            st.error(f"Missing Bot Token or the {notify_route} ID.")
+        else:
+            if notify_type == "Full digest":
+                content = tga.build_digest(st.session_state)
+            elif notify_type == "To-do list":
+                content = "✅ To-Do List\n\n" + tga.format_todos(st.session_state.todos)
+            elif notify_type == "Timetable":
+                content = "🗓️ Timetable\n\n" + tga.format_timetable(st.session_state.timetable)
+            else:
+                content = "⭐ Important Messages\n\n" + tga.format_important(
+                    st.session_state.telegram_important, limit=10
+                )
+            ok, info = send_telegram_message(bot_token.strip(), target.strip(), content)
+            if ok:
+                st.success(f"Notification sent to {notify_route}.")
+            else:
+                st.error(f"Failed to send: {info}")
+
+    st.subheader("Incoming messages & questions")
     check_col1, check_col2 = st.columns([1, 3])
     with check_col1:
         check_clicked = st.button("Check for new messages")
     with check_col2:
         st.caption(
-            "Fetches anything sent to your bot since the last check and sorts it below. "
-            "Streamlit apps don't listen for pushes in real time, so click this (or refresh) "
-            "to pull the latest."
+            "Fetches anything sent to your bot since the last check. Messages starting with "
+            "/ask, ?, /todos, /timetable, /important, /summary, or /help are treated as "
+            "commands and answered directly back on Telegram; everything else is sorted into "
+            "Inbox or Important. Streamlit doesn't push in real time, so click this (or "
+            "refresh) to pull the latest."
         )
 
     if check_clicked:
@@ -443,23 +547,67 @@ with main_col:
                 st.error(f"Couldn't fetch updates: {err}")
             else:
                 messages = extract_messages(updates)
+                answered, sorted_count = 0, 0
+
                 for m in messages:
-                    bucket = classify_message(m["text"], important_keywords)
-                    if bucket == "important":
-                        st.session_state.telegram_important.append(m)
-                    else:
-                        st.session_state.telegram_inbox.append(m)
                     st.session_state.telegram_last_update_id = max(
                         st.session_state.telegram_last_update_id or 0, m["update_id"]
                     )
+                    reply_chat = m["chat_id"] or chat_id
+
+                    if tga.is_command(m["text"]):
+                        cmd, arg = tga.parse_command(m["text"])
+                        if cmd == "todos":
+                            reply = "✅ To-Do List\n\n" + tga.format_todos(st.session_state.todos)
+                        elif cmd == "timetable":
+                            reply = "🗓️ Timetable\n\n" + tga.format_timetable(st.session_state.timetable)
+                        elif cmd == "important":
+                            reply = "⭐ Important Messages\n\n" + tga.format_important(
+                                st.session_state.telegram_important, limit=10
+                            )
+                        elif cmd == "summary":
+                            reply = tga.build_digest(st.session_state)
+                        elif cmd == "help":
+                            reply = tga.HELP_TEXT
+                        else:  # "ask"
+                            if not api_key.strip():
+                                reply = "I can't answer that — no GROQ API key is configured."
+                            elif not arg.strip():
+                                reply = "Ask me something after /ask — e.g. `/ask what's on my schedule today?`"
+                            else:
+                                state_ctx = tga.build_state_context(st.session_state)
+                                answer, _ = answer_unified_query(
+                                    st.session_state.vectorstore, arg, api_key.strip(), state_ctx
+                                )
+                                reply = answer
+                                st.session_state.telegram_commands.append(
+                                    {"question": arg, "answer": answer, "date": m.get("date")}
+                                )
+                        send_telegram_message(bot_token.strip(), str(reply_chat), reply)
+                        answered += 1
+                    else:
+                        bucket = classify_message(m["text"], important_keywords)
+                        if bucket == "important":
+                            st.session_state.telegram_important.append(m)
+                            if st.session_state.telegram_auto_escalate and priority_chat_id.strip():
+                                send_telegram_message(
+                                    bot_token.strip(),
+                                    priority_chat_id.strip(),
+                                    f"⚠️ Important message flagged:\n\n{m['text']}",
+                                )
+                        else:
+                            st.session_state.telegram_inbox.append(m)
+                        sorted_count += 1
+
                 if messages:
-                    st.success(f"Pulled in {len(messages)} new message(s).")
+                    st.success(f"Answered {answered} command(s), sorted {sorted_count} message(s).")
                 else:
                     st.info("No new messages.")
 
-    inbox_tab, important_tab = st.tabs(
+    inbox_tab, important_tab, assistant_tab = st.tabs(
         [f"📥 Inbox ({len(st.session_state.telegram_inbox)})",
-         f"⭐ Important ({len(st.session_state.telegram_important)})"]
+         f"⭐ Important ({len(st.session_state.telegram_important)})",
+         f"🤖 Assistant ({len(st.session_state.telegram_commands)})"]
     )
 
     with inbox_tab:
@@ -480,6 +628,19 @@ with main_col:
                 when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
                 st.markdown(f"**{m['from']}** · {when}")
                 st.write(m["text"])
+                st.divider()
+
+    with assistant_tab:
+        if not st.session_state.telegram_commands:
+            st.caption("No questions asked via Telegram yet — try texting your bot `/ask ...`.")
+        else:
+            for qa in reversed(st.session_state.telegram_commands):
+                when = (
+                    datetime.utcfromtimestamp(qa["date"]).strftime("%Y-%m-%d %H:%M UTC")
+                    if qa.get("date") else ""
+                )
+                st.markdown(f"**Q ({when}):** {qa['question']}")
+                st.write(qa["answer"])
                 st.divider()
 
 # ---------------------------------------------------------------------------
