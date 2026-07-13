@@ -1,11 +1,12 @@
 import os
 import tempfile
 from datetime import datetime
- 
+
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 from groq import Groq
+
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
@@ -21,7 +22,14 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
- 
+
+from telegram_utils import (
+    send_telegram_message,
+    get_telegram_updates,
+    extract_messages,
+    classify_message,
+)
+
 LOADER_MAP = {
     ".pdf": PyPDFLoader,
     ".docx": Docx2txtLoader,
@@ -29,32 +37,31 @@ LOADER_MAP = {
     ".md": UnstructuredMarkdownLoader,
     ".csv": CSVLoader,
 }
- 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".mp4", ".mpeg", ".mpga"}
- 
 TRANSCRIBE_MODEL = "whisper-large-v3-turbo"
- 
+
 PROMPT = ChatPromptTemplate.from_template(
     """Answer the question using only the context below. Each context chunk is labeled with its source file.
 If the answer isn't in the context, say you don't know.
- 
+
 Context:
 {context}
- 
+
 Question: {question}
- 
+
 Answer:"""
 )
- 
- 
+
+
 @st.cache_resource(show_spinner=False)
 def get_embeddings():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
- 
- 
+
+
 @st.cache_resource(show_spinner=False)
 def get_log_worksheet():
     """Connect to the Google Sheet used for logging Q&A.
+
     Returns (worksheet, error) — worksheet is None if logging is unavailable,
     and error explains why (or is None if simply not configured)."""
     try:
@@ -62,7 +69,7 @@ def get_log_worksheet():
         sheet_url = st.secrets["GSHEET_URL"]
     except Exception:
         return None, None  # not configured — not an error, just off
- 
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -72,16 +79,14 @@ def get_log_worksheet():
         client = gspread.authorize(creds)
         sheet = client.open_by_url(sheet_url)
         worksheet = sheet.sheet1
- 
         # Add a header row if the sheet is empty
         if not worksheet.get_all_values():
             worksheet.append_row(["timestamp", "question", "answer"])
     except Exception as e:
         return None, str(e)
- 
     return worksheet, None
- 
- 
+
+
 def log_qa(question, answer):
     """Best-effort logging: never let a logging failure break the app."""
     worksheet, _ = get_log_worksheet()
@@ -91,8 +96,8 @@ def log_qa(question, answer):
         worksheet.append_row([datetime.utcnow().isoformat(), question, answer])
     except Exception as e:
         st.caption(f"(Couldn't log this Q&A to Google Sheets: {e})")
- 
- 
+
+
 def transcribe_audio(path, api_key):
     """Send an audio file to Groq's Whisper endpoint and return the transcript text."""
     client = Groq(api_key=api_key)
@@ -102,11 +107,11 @@ def transcribe_audio(path, api_key):
             model=TRANSCRIBE_MODEL,
         )
     return transcript.text
- 
- 
+
+
 def load_any_file(path, display_name, api_key=None):
     ext = os.path.splitext(display_name)[1].lower()
- 
+
     if ext in AUDIO_EXTENSIONS:
         if not api_key:
             return []
@@ -114,7 +119,7 @@ def load_any_file(path, display_name, api_key=None):
         if not text or not text.strip():
             return []
         return [Document(page_content=text, metadata={"source": display_name})]
- 
+
     loader_cls = LOADER_MAP.get(ext)
     if loader_cls is None:
         return []
@@ -122,18 +127,18 @@ def load_any_file(path, display_name, api_key=None):
     for d in docs:
         d.metadata["source"] = display_name
     return docs
- 
- 
+
+
 def format_docs(docs):
     return "\n\n".join(
         f"[Source: {d.metadata.get('source', 'unknown')}]\n{d.page_content}" for d in docs
     )
- 
- 
+
+
 def build_index(uploaded_files, api_key):
     all_docs = []
     skipped = []
- 
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         for uf in uploaded_files:
             ext = os.path.splitext(uf.name)[1].lower()
@@ -143,51 +148,63 @@ def build_index(uploaded_files, api_key):
             if ext in AUDIO_EXTENSIONS and not api_key:
                 skipped.append(f"{uf.name} (needs GROQ key to transcribe)")
                 continue
+
             tmp_path = os.path.join(tmp_dir, uf.name)
             with open(tmp_path, "wb") as f:
                 f.write(uf.getbuffer())
+
             all_docs.extend(load_any_file(tmp_path, uf.name, api_key))
- 
+
     if not all_docs:
         return None, "Couldn't extract text from any uploaded file.", skipped
- 
+
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(all_docs)
- 
     vectorstore = FAISS.from_documents(chunks, get_embeddings())
+
     indexed_count = len(uploaded_files) - len(skipped)
     msg = f"Indexed {len(chunks)} chunks from {indexed_count} file(s)."
     return vectorstore, msg, skipped
- 
- 
+
+
 def answer_question(vectorstore, question, api_key):
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=api_key)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
- 
+
     rag_chain = (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
         | PROMPT
         | llm
         | StrOutputParser()
     )
- 
+
     source_docs = retriever.invoke(question)
     answer = rag_chain.invoke(question)
     return answer, source_docs
- 
- 
+
+
 st.set_page_config(page_title="Multi-File RAG", page_icon="📚", layout="wide")
 st.title("📚 Multi-File RAG")
 st.markdown(
     "Upload files (PDF, DOCX, TXT, MD, CSV, or **audio**), build the index, then ask "
     "questions — by typing or by voice. Answers cite which file they came from."
 )
- 
+
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
 if "question_text" not in st.session_state:
     st.session_state.question_text = ""
- 
+
+# --- Telegram section state ---
+if "telegram_inbox" not in st.session_state:
+    st.session_state.telegram_inbox = []
+if "telegram_important" not in st.session_state:
+    st.session_state.telegram_important = []
+if "telegram_last_update_id" not in st.session_state:
+    st.session_state.telegram_last_update_id = None
+if "telegram_keywords" not in st.session_state:
+    st.session_state.telegram_keywords = "urgent, asap, important"
+
 with st.sidebar:
     st.header("1. Upload & index")
     uploaded_files = st.file_uploader(
@@ -195,6 +212,7 @@ with st.sidebar:
         type=["pdf", "docx", "txt", "md", "csv", "mp3", "wav", "m4a", "ogg", "flac", "webm", "mp4"],
         accept_multiple_files=True,
     )
+
     default_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
     api_key = st.text_input(
         "GROQ API key (optional if set in Streamlit secrets)",
@@ -202,7 +220,7 @@ with st.sidebar:
         value=default_key,
     )
     st.caption("Audio files are transcribed with Groq's Whisper model before indexing, so a GROQ key is required for those.")
- 
+
     st.divider()
     _worksheet, _log_error = get_log_worksheet()
     if _worksheet is not None:
@@ -211,7 +229,7 @@ with st.sidebar:
         st.caption("📝 Logging: off (add `gcp_service_account` and `GSHEET_URL` to secrets to enable).")
     else:
         st.caption(f"📝 Logging: off — connection failed: {_log_error}")
- 
+
     if st.button("Build Index", type="primary", disabled=not uploaded_files):
         with st.spinner("Loading files, transcribing audio if any, and building index..."):
             vectorstore, msg, skipped = build_index(uploaded_files, api_key.strip())
@@ -222,31 +240,31 @@ with st.sidebar:
                 st.success(msg)
                 if skipped:
                     st.warning(f"Skipped: {', '.join(skipped)}")
- 
+
 st.header("2. Ask a question")
- 
 col1, col2 = st.columns([3, 1])
+
 with col1:
     question = st.text_input("Type your question", value=st.session_state.question_text)
+
 with col2:
     st.write("Or record it:")
     voice_question = st.audio_input("Record a question")
- 
-if voice_question is not None:
-    if not api_key.strip():
-        st.warning("Add your GROQ API key to transcribe voice questions.")
-    else:
-        with st.spinner("Transcribing your question..."):
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(voice_question.getbuffer())
-                tmp_path = tmp.name
-            question = transcribe_audio(tmp_path, api_key.strip())
-            os.remove(tmp_path)
-        st.session_state.question_text = question
-        st.info(f"Heard: \"{question}\"")
- 
+    if voice_question is not None:
+        if not api_key.strip():
+            st.warning("Add your GROQ API key to transcribe voice questions.")
+        else:
+            with st.spinner("Transcribing your question..."):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(voice_question.getbuffer())
+                    tmp_path = tmp.name
+                question = transcribe_audio(tmp_path, api_key.strip())
+                os.remove(tmp_path)
+                st.session_state.question_text = question
+            st.info(f"Heard: \"{question}\"")
+
 ask_clicked = st.button("Ask", type="primary")
- 
+
 if ask_clicked:
     if st.session_state.vectorstore is None:
         st.error("Upload files and click 'Build Index' first.")
@@ -260,10 +278,10 @@ if ask_clicked:
                 st.session_state.vectorstore, question, api_key.strip()
             )
         log_qa(question, answer)
- 
+
         st.subheader("Answer")
         st.write(answer)
- 
+
         st.subheader("Sources")
         for i, d in enumerate(source_docs, 1):
             src = d.metadata.get("source", "unknown")
@@ -271,3 +289,126 @@ if ask_clicked:
             loc = f"{src}" + (f" (page {page})" if page is not None else "")
             with st.expander(f"[{i}] {loc}"):
                 st.write(d.page_content[:500] + ("..." if len(d.page_content) > 500 else ""))
+
+# ---------------------------------------------------------------------------
+# 3. Telegram
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("3. Telegram")
+st.markdown(
+    "Send messages through your Telegram bot, and pull in anything sent *to* the bot — "
+    "each incoming message is automatically sorted into **Inbox** or **Important** based "
+    "on keywords you define."
+)
+
+default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
+
+tg_col1, tg_col2 = st.columns(2)
+with tg_col1:
+    bot_token = st.text_input(
+        "Telegram Bot Token",
+        type="password",
+        value=default_bot_token,
+        help="Get this from @BotFather on Telegram.",
+    )
+with tg_col2:
+    chat_id = st.text_input(
+        "Chat ID",
+        value=default_chat_id,
+        help="The chat you're sending to / receiving from. See integration steps below for how to find it.",
+    )
+
+keywords_input = st.text_input(
+    "Important keywords (comma-separated)",
+    value=st.session_state.telegram_keywords,
+    help="Any incoming message containing one of these words (case-insensitive) is filed under Important.",
+)
+st.session_state.telegram_keywords = keywords_input
+important_keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+
+st.subheader("Send a message")
+send_col1, send_col2 = st.columns([4, 1])
+with send_col1:
+    outgoing_text = st.text_area("Message", key="telegram_outgoing_text", height=80)
+with send_col2:
+    st.write("")
+    st.write("")
+    send_clicked = st.button("Send", type="primary")
+
+if send_clicked:
+    if not bot_token.strip() or not chat_id.strip():
+        st.error("Add your Bot Token and Chat ID first (see integration steps below).")
+    elif not outgoing_text.strip():
+        st.error("Write a message first.")
+    else:
+        ok, info = send_telegram_message(bot_token.strip(), chat_id.strip(), outgoing_text.strip())
+        if ok:
+            st.success("Message sent.")
+        else:
+            st.error(f"Failed to send: {info}")
+
+st.subheader("Incoming messages")
+check_col1, check_col2 = st.columns([1, 3])
+with check_col1:
+    check_clicked = st.button("Check for new messages")
+with check_col2:
+    st.caption(
+        "Fetches anything sent to your bot since the last check and sorts it below. "
+        "Streamlit apps don't listen for pushes in real time, so click this (or refresh) "
+        "to pull the latest."
+    )
+
+if check_clicked:
+    if not bot_token.strip():
+        st.error("Add your Bot Token first.")
+    else:
+        offset = (
+            st.session_state.telegram_last_update_id + 1
+            if st.session_state.telegram_last_update_id is not None
+            else None
+        )
+        updates, err = get_telegram_updates(bot_token.strip(), offset=offset)
+        if err:
+            st.error(f"Couldn't fetch updates: {err}")
+        else:
+            messages = extract_messages(updates)
+            for m in messages:
+                bucket = classify_message(m["text"], important_keywords)
+                if bucket == "important":
+                    st.session_state.telegram_important.append(m)
+                else:
+                    st.session_state.telegram_inbox.append(m)
+                st.session_state.telegram_last_update_id = max(
+                    st.session_state.telegram_last_update_id or 0, m["update_id"]
+                )
+            if messages:
+                st.success(f"Pulled in {len(messages)} new message(s).")
+            else:
+                st.info("No new messages.")
+
+inbox_tab, important_tab = st.tabs(
+    [f"📥 Inbox ({len(st.session_state.telegram_inbox)})",
+     f"⭐ Important ({len(st.session_state.telegram_important)})"]
+)
+
+with inbox_tab:
+    if not st.session_state.telegram_inbox:
+        st.caption("No inbox messages yet.")
+    else:
+        for m in reversed(st.session_state.telegram_inbox):
+            when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
+            st.markdown(f"**{m['from']}** · {when}")
+            st.write(m["text"])
+            st.divider()
+
+with important_tab:
+    if not st.session_state.telegram_important:
+        st.caption("No important messages yet.")
+    else:
+        for m in reversed(st.session_state.telegram_important):
+            when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
+            st.markdown(f"**{m['from']}** · {when}")
+            st.write(m["text"])
+            st.divider()
+
