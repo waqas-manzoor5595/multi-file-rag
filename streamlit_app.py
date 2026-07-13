@@ -116,14 +116,28 @@ def transcribe_audio(path, api_key):
     return transcript.text
 
 
+SILENCE_HALLUCINATIONS = {
+    "thank you.", "thanks for watching!", "thank you for watching!",
+    "thanks for watching.", "you", "bye.",
+}
+MIN_AUDIO_BYTES = 8000  # below this, a recording is almost certainly silent/empty
+
+
 def load_any_file(path, display_name, api_key=None):
     ext = os.path.splitext(display_name)[1].lower()
 
     if ext in AUDIO_EXTENSIONS:
         if not api_key:
             return []
+        if os.path.getsize(path) < MIN_AUDIO_BYTES:
+            # Too small to contain real speech — skip rather than let Whisper
+            # hallucinate a generic phrase like "Thank you." on silence.
+            return []
         text = transcribe_audio(path, api_key)
         if not text or not text.strip():
+            return []
+        if text.strip().lower() in SILENCE_HALLUCINATIONS:
+            # Almost certainly a silence hallucination, not real content.
             return []
         return [Document(page_content=text, metadata={"source": display_name})]
 
@@ -160,7 +174,11 @@ def build_index(uploaded_files, api_key):
             with open(tmp_path, "wb") as f:
                 f.write(uf.getbuffer())
 
-            all_docs.extend(load_any_file(tmp_path, uf.name, api_key))
+            docs = load_any_file(tmp_path, uf.name, api_key)
+            if ext in AUDIO_EXTENSIONS and not docs:
+                skipped.append(f"{uf.name} (silent/no speech detected)")
+                continue
+            all_docs.extend(docs)
 
     if not all_docs:
         return None, "Couldn't extract text from any uploaded file.", skipped
@@ -293,8 +311,18 @@ with main_col:
         st.write("Or record it:")
         voice_question = st.audio_input("Record a question")
         if voice_question is not None:
+            st.audio(voice_question)  # play back what was actually captured, for sanity-checking
+            audio_bytes = voice_question.getvalue()
             if not api_key.strip():
                 st.warning("Add your GROQ API key to transcribe voice questions.")
+            elif len(audio_bytes) < 8000:
+                st.warning(
+                    "That recording looks very short or silent (only "
+                    f"{len(audio_bytes)} bytes). Whisper tends to hallucinate "
+                    "\"Thank you\" on empty audio rather than erroring out. "
+                    "Check your mic permissions/input device, then record again "
+                    "and speak for a couple of seconds before stopping."
+                )
             else:
                 with st.spinner("Transcribing your question..."):
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
