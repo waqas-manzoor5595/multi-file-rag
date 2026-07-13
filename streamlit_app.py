@@ -29,6 +29,13 @@ from telegram_utils import (
     extract_messages,
     classify_message,
 )
+from dashboard_utils import (
+    add_timetable_entry,
+    remove_timetable_entry,
+    add_todo,
+    toggle_todo,
+    remove_todo,
+)
 
 LOADER_MAP = {
     ".pdf": PyPDFLoader,
@@ -183,11 +190,34 @@ def answer_question(vectorstore, question, api_key):
     return answer, source_docs
 
 
-st.set_page_config(page_title="Multi-File RAG", page_icon="📚", layout="wide")
-st.title("📚 Multi-File RAG")
+st.set_page_config(page_title="Multi-File RAG Dashboard", page_icon="📚", layout="wide")
+
 st.markdown(
-    "Upload files (PDF, DOCX, TXT, MD, CSV, or **audio**), build the index, then ask "
-    "questions — by typing or by voice. Answers cite which file they came from."
+    """
+    <style>
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        background-color: rgba(127, 127, 127, 0.05);
+        border-radius: 12px;
+        padding: 0.25rem 0.25rem 0.75rem 0.25rem;
+    }
+    .dash-card-title {
+        font-size: 1.05rem;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+    }
+    .todo-done {
+        text-decoration: line-through;
+        opacity: 0.55;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("📚 Multi-File RAG Dashboard")
+st.caption(
+    "Upload files (PDF, DOCX, TXT, MD, CSV, or audio), ask questions, message Telegram, "
+    "and keep your schedule + to-dos all in one place."
 )
 
 if "vectorstore" not in st.session_state:
@@ -204,6 +234,12 @@ if "telegram_last_update_id" not in st.session_state:
     st.session_state.telegram_last_update_id = None
 if "telegram_keywords" not in st.session_state:
     st.session_state.telegram_keywords = "urgent, asap, important"
+
+# --- Dashboard widgets state ---
+if "timetable" not in st.session_state:
+    st.session_state.timetable = []
+if "todos" not in st.session_state:
+    st.session_state.todos = []
 
 with st.sidebar:
     st.header("1. Upload & index")
@@ -241,174 +277,236 @@ with st.sidebar:
                 if skipped:
                     st.warning(f"Skipped: {', '.join(skipped)}")
 
-st.header("2. Ask a question")
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    question = st.text_input("Type your question", value=st.session_state.question_text)
-
-with col2:
-    st.write("Or record it:")
-    voice_question = st.audio_input("Record a question")
-    if voice_question is not None:
-        if not api_key.strip():
-            st.warning("Add your GROQ API key to transcribe voice questions.")
-        else:
-            with st.spinner("Transcribing your question..."):
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(voice_question.getbuffer())
-                    tmp_path = tmp.name
-                question = transcribe_audio(tmp_path, api_key.strip())
-                os.remove(tmp_path)
-                st.session_state.question_text = question
-            st.info(f"Heard: \"{question}\"")
-
-ask_clicked = st.button("Ask", type="primary")
-
-if ask_clicked:
-    if st.session_state.vectorstore is None:
-        st.error("Upload files and click 'Build Index' first.")
-    elif not question.strip():
-        st.error("Please enter or record a question.")
-    elif not api_key.strip():
-        st.error("No GROQ API key found. Set it in the sidebar or in Streamlit secrets (GROQ_API_KEY).")
-    else:
-        with st.spinner("Thinking..."):
-            answer, source_docs = answer_question(
-                st.session_state.vectorstore, question, api_key.strip()
-            )
-        log_qa(question, answer)
-
-        st.subheader("Answer")
-        st.write(answer)
-
-        st.subheader("Sources")
-        for i, d in enumerate(source_docs, 1):
-            src = d.metadata.get("source", "unknown")
-            page = d.metadata.get("page")
-            loc = f"{src}" + (f" (page {page})" if page is not None else "")
-            with st.expander(f"[{i}] {loc}"):
-                st.write(d.page_content[:500] + ("..." if len(d.page_content) > 500 else ""))
+main_col, side_col = st.columns([2.4, 1], gap="large")
 
 # ---------------------------------------------------------------------------
-# 3. Telegram
+# MAIN COLUMN — RAG Q&A + Telegram
 # ---------------------------------------------------------------------------
-st.divider()
-st.header("3. Telegram")
-st.markdown(
-    "Send messages through your Telegram bot, and pull in anything sent *to* the bot — "
-    "each incoming message is automatically sorted into **Inbox** or **Important** based "
-    "on keywords you define."
-)
+with main_col:
+    st.header("2. Ask a question")
+    col1, col2 = st.columns([3, 1])
 
-default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
-default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
+    with col1:
+        question = st.text_input("Type your question", value=st.session_state.question_text)
 
-tg_col1, tg_col2 = st.columns(2)
-with tg_col1:
-    bot_token = st.text_input(
-        "Telegram Bot Token",
-        type="password",
-        value=default_bot_token,
-        help="Get this from @BotFather on Telegram.",
-    )
-with tg_col2:
-    chat_id = st.text_input(
-        "Chat ID",
-        value=default_chat_id,
-        help="The chat you're sending to / receiving from. See integration steps below for how to find it.",
-    )
-
-keywords_input = st.text_input(
-    "Important keywords (comma-separated)",
-    value=st.session_state.telegram_keywords,
-    help="Any incoming message containing one of these words (case-insensitive) is filed under Important.",
-)
-st.session_state.telegram_keywords = keywords_input
-important_keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
-
-st.subheader("Send a message")
-send_col1, send_col2 = st.columns([4, 1])
-with send_col1:
-    outgoing_text = st.text_area("Message", key="telegram_outgoing_text", height=80)
-with send_col2:
-    st.write("")
-    st.write("")
-    send_clicked = st.button("Send", type="primary")
-
-if send_clicked:
-    if not bot_token.strip() or not chat_id.strip():
-        st.error("Add your Bot Token and Chat ID first (see integration steps below).")
-    elif not outgoing_text.strip():
-        st.error("Write a message first.")
-    else:
-        ok, info = send_telegram_message(bot_token.strip(), chat_id.strip(), outgoing_text.strip())
-        if ok:
-            st.success("Message sent.")
-        else:
-            st.error(f"Failed to send: {info}")
-
-st.subheader("Incoming messages")
-check_col1, check_col2 = st.columns([1, 3])
-with check_col1:
-    check_clicked = st.button("Check for new messages")
-with check_col2:
-    st.caption(
-        "Fetches anything sent to your bot since the last check and sorts it below. "
-        "Streamlit apps don't listen for pushes in real time, so click this (or refresh) "
-        "to pull the latest."
-    )
-
-if check_clicked:
-    if not bot_token.strip():
-        st.error("Add your Bot Token first.")
-    else:
-        offset = (
-            st.session_state.telegram_last_update_id + 1
-            if st.session_state.telegram_last_update_id is not None
-            else None
-        )
-        updates, err = get_telegram_updates(bot_token.strip(), offset=offset)
-        if err:
-            st.error(f"Couldn't fetch updates: {err}")
-        else:
-            messages = extract_messages(updates)
-            for m in messages:
-                bucket = classify_message(m["text"], important_keywords)
-                if bucket == "important":
-                    st.session_state.telegram_important.append(m)
-                else:
-                    st.session_state.telegram_inbox.append(m)
-                st.session_state.telegram_last_update_id = max(
-                    st.session_state.telegram_last_update_id or 0, m["update_id"]
-                )
-            if messages:
-                st.success(f"Pulled in {len(messages)} new message(s).")
+    with col2:
+        st.write("Or record it:")
+        voice_question = st.audio_input("Record a question")
+        if voice_question is not None:
+            if not api_key.strip():
+                st.warning("Add your GROQ API key to transcribe voice questions.")
             else:
-                st.info("No new messages.")
+                with st.spinner("Transcribing your question..."):
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp.write(voice_question.getbuffer())
+                        tmp_path = tmp.name
+                    question = transcribe_audio(tmp_path, api_key.strip())
+                    os.remove(tmp_path)
+                    st.session_state.question_text = question
+                st.info(f"Heard: \"{question}\"")
 
-inbox_tab, important_tab = st.tabs(
-    [f"📥 Inbox ({len(st.session_state.telegram_inbox)})",
-     f"⭐ Important ({len(st.session_state.telegram_important)})"]
-)
+    ask_clicked = st.button("Ask", type="primary")
 
-with inbox_tab:
-    if not st.session_state.telegram_inbox:
-        st.caption("No inbox messages yet.")
-    else:
-        for m in reversed(st.session_state.telegram_inbox):
-            when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
-            st.markdown(f"**{m['from']}** · {when}")
-            st.write(m["text"])
-            st.divider()
+    if ask_clicked:
+        if st.session_state.vectorstore is None:
+            st.error("Upload files and click 'Build Index' first.")
+        elif not question.strip():
+            st.error("Please enter or record a question.")
+        elif not api_key.strip():
+            st.error("No GROQ API key found. Set it in the sidebar or in Streamlit secrets (GROQ_API_KEY).")
+        else:
+            with st.spinner("Thinking..."):
+                answer, source_docs = answer_question(
+                    st.session_state.vectorstore, question, api_key.strip()
+                )
+            log_qa(question, answer)
 
-with important_tab:
-    if not st.session_state.telegram_important:
-        st.caption("No important messages yet.")
-    else:
-        for m in reversed(st.session_state.telegram_important):
-            when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
-            st.markdown(f"**{m['from']}** · {when}")
-            st.write(m["text"])
-            st.divider()
+            st.subheader("Answer")
+            st.write(answer)
+
+            st.subheader("Sources")
+            for i, d in enumerate(source_docs, 1):
+                src = d.metadata.get("source", "unknown")
+                page = d.metadata.get("page")
+                loc = f"{src}" + (f" (page {page})" if page is not None else "")
+                with st.expander(f"[{i}] {loc}"):
+                    st.write(d.page_content[:500] + ("..." if len(d.page_content) > 500 else ""))
+
+    # -----------------------------------------------------------------------
+    # 3. Telegram
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.header("3. Telegram")
+    st.markdown(
+        "Send messages through your Telegram bot, and pull in anything sent *to* the bot — "
+        "each incoming message is automatically sorted into **Inbox** or **Important** based "
+        "on keywords you define."
+    )
+
+    default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+    default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
+
+    tg_col1, tg_col2 = st.columns(2)
+    with tg_col1:
+        bot_token = st.text_input(
+            "Telegram Bot Token",
+            type="password",
+            value=default_bot_token,
+            help="Get this from @BotFather on Telegram.",
+        )
+    with tg_col2:
+        chat_id = st.text_input(
+            "Chat ID",
+            value=default_chat_id,
+            help="The chat you're sending to / receiving from.",
+        )
+
+    keywords_input = st.text_input(
+        "Important keywords (comma-separated)",
+        value=st.session_state.telegram_keywords,
+        help="Any incoming message containing one of these words (case-insensitive) is filed under Important.",
+    )
+    st.session_state.telegram_keywords = keywords_input
+    important_keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+
+    st.subheader("Send a message")
+    send_col1, send_col2 = st.columns([4, 1])
+    with send_col1:
+        outgoing_text = st.text_area("Message", key="telegram_outgoing_text", height=80)
+    with send_col2:
+        st.write("")
+        st.write("")
+        send_clicked = st.button("Send", type="primary")
+
+    if send_clicked:
+        if not bot_token.strip() or not chat_id.strip():
+            st.error("Add your Bot Token and Chat ID first.")
+        elif not outgoing_text.strip():
+            st.error("Write a message first.")
+        else:
+            ok, info = send_telegram_message(bot_token.strip(), chat_id.strip(), outgoing_text.strip())
+            if ok:
+                st.success("Message sent.")
+            else:
+                st.error(f"Failed to send: {info}")
+
+    st.subheader("Incoming messages")
+    check_col1, check_col2 = st.columns([1, 3])
+    with check_col1:
+        check_clicked = st.button("Check for new messages")
+    with check_col2:
+        st.caption(
+            "Fetches anything sent to your bot since the last check and sorts it below. "
+            "Streamlit apps don't listen for pushes in real time, so click this (or refresh) "
+            "to pull the latest."
+        )
+
+    if check_clicked:
+        if not bot_token.strip():
+            st.error("Add your Bot Token first.")
+        else:
+            offset = (
+                st.session_state.telegram_last_update_id + 1
+                if st.session_state.telegram_last_update_id is not None
+                else None
+            )
+            updates, err = get_telegram_updates(bot_token.strip(), offset=offset)
+            if err:
+                st.error(f"Couldn't fetch updates: {err}")
+            else:
+                messages = extract_messages(updates)
+                for m in messages:
+                    bucket = classify_message(m["text"], important_keywords)
+                    if bucket == "important":
+                        st.session_state.telegram_important.append(m)
+                    else:
+                        st.session_state.telegram_inbox.append(m)
+                    st.session_state.telegram_last_update_id = max(
+                        st.session_state.telegram_last_update_id or 0, m["update_id"]
+                    )
+                if messages:
+                    st.success(f"Pulled in {len(messages)} new message(s).")
+                else:
+                    st.info("No new messages.")
+
+    inbox_tab, important_tab = st.tabs(
+        [f"📥 Inbox ({len(st.session_state.telegram_inbox)})",
+         f"⭐ Important ({len(st.session_state.telegram_important)})"]
+    )
+
+    with inbox_tab:
+        if not st.session_state.telegram_inbox:
+            st.caption("No inbox messages yet.")
+        else:
+            for m in reversed(st.session_state.telegram_inbox):
+                when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
+                st.markdown(f"**{m['from']}** · {when}")
+                st.write(m["text"])
+                st.divider()
+
+    with important_tab:
+        if not st.session_state.telegram_important:
+            st.caption("No important messages yet.")
+        else:
+            for m in reversed(st.session_state.telegram_important):
+                when = datetime.utcfromtimestamp(m["date"]).strftime("%Y-%m-%d %H:%M UTC") if m.get("date") else ""
+                st.markdown(f"**{m['from']}** · {when}")
+                st.write(m["text"])
+                st.divider()
+
+# ---------------------------------------------------------------------------
+# SIDE COLUMN — Timetable + To-Do List
+# ---------------------------------------------------------------------------
+with side_col:
+    with st.container(border=True):
+        st.markdown('<div class="dash-card-title">🗓️ Timetable</div>', unsafe_allow_html=True)
+
+        with st.form("add_timetable_form", clear_on_submit=True):
+            tt_time = st.time_input("Time", label_visibility="collapsed")
+            tt_activity = st.text_input("Activity", placeholder="e.g. Team standup", label_visibility="collapsed")
+            tt_submitted = st.form_submit_button("+ Add to timetable", use_container_width=True)
+            if tt_submitted:
+                add_timetable_entry(st.session_state, tt_time.strftime("%H:%M"), tt_activity)
+
+        if not st.session_state.timetable:
+            st.caption("Nothing scheduled yet.")
+        else:
+            for entry in st.session_state.timetable:
+                row1, row2 = st.columns([5, 1])
+                with row1:
+                    st.markdown(f"**{entry['time']}** — {entry['activity']}")
+                with row2:
+                    if st.button("✕", key=f"del_tt_{entry['id']}", help="Remove"):
+                        remove_timetable_entry(st.session_state, entry["id"])
+                        st.rerun()
+
+    with st.container(border=True):
+        st.markdown('<div class="dash-card-title">✅ To-Do List</div>', unsafe_allow_html=True)
+
+        with st.form("add_todo_form", clear_on_submit=True):
+            todo_text = st.text_input("Task", placeholder="e.g. Review Q3 report", label_visibility="collapsed")
+            todo_submitted = st.form_submit_button("+ Add task", use_container_width=True)
+            if todo_submitted:
+                add_todo(st.session_state, todo_text)
+
+        if not st.session_state.todos:
+            st.caption("No tasks yet.")
+        else:
+            pending = [t for t in st.session_state.todos if not t["done"]]
+            done = [t for t in st.session_state.todos if t["done"]]
+
+            for t in pending + done:
+                row1, row2 = st.columns([5, 1])
+                with row1:
+                    checked = st.checkbox(t["text"], value=t["done"], key=f"todo_{t['id']}")
+                    if checked != t["done"]:
+                        toggle_todo(st.session_state, t["id"], checked)
+                        st.rerun()
+                with row2:
+                    if st.button("✕", key=f"del_todo_{t['id']}", help="Remove"):
+                        remove_todo(st.session_state, t["id"])
+                        st.rerun()
+
+            if done:
+                st.caption(f"{len(done)}/{len(st.session_state.todos)} completed")
 
