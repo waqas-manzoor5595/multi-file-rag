@@ -176,6 +176,21 @@ def format_docs(docs):
     )
 
 
+def add_text_to_index(vectorstore, text, source_label):
+    """Embed a piece of text (e.g. a Telegram message) and add it to an
+    existing FAISS vectorstore, or create a new one if none exists yet.
+    Returns the (possibly newly created) vectorstore."""
+    if not text or not text.strip():
+        return vectorstore
+    doc = Document(page_content=text, metadata={"source": source_label})
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = splitter.split_documents([doc])
+    if vectorstore is None:
+        return FAISS.from_documents(chunks, get_embeddings())
+    vectorstore.add_documents(chunks)
+    return vectorstore
+
+
 def build_index(uploaded_files, api_key):
     all_docs = []
     skipped = []
@@ -295,8 +310,6 @@ if "telegram_keywords" not in st.session_state:
     st.session_state.telegram_keywords = "urgent, asap, important"
 if "telegram_commands" not in st.session_state:
     st.session_state.telegram_commands = []  # log of {question, answer} pairs asked via Telegram
-if "telegram_auto_escalate" not in st.session_state:
-    st.session_state.telegram_auto_escalate = False
 
 # --- Dashboard widgets state ---
 if "timetable" not in st.session_state:
@@ -411,40 +424,28 @@ with main_col:
     st.divider()
     st.header("3. Telegram")
     st.markdown(
-        "Send messages through your Telegram bot, pull in anything sent *to* it, and — the "
-        "unique bit — **text the bot a question and it answers using your documents, todos, "
-        "timetable, and important messages, all sent back as a Telegram reply.**"
+        "Your **main bot** answers questions — text it `/ask ...` (or start with `?`) and it "
+        "answers using your documents, your todos/timetable, **and anything sent to it or your "
+        "content bot below**, since those get embedded straight into the same RAG index."
     )
 
     default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
-    default_priority_chat_id = st.secrets.get(
-        "TELEGRAM_PRIORITY_CHAT_ID", os.environ.get("TELEGRAM_PRIORITY_CHAT_ID", "")
-    )
 
     tg_col1, tg_col2 = st.columns(2)
     with tg_col1:
         bot_token = st.text_input(
-            "Telegram Bot Token",
+            "Main Bot Token",
             type="password",
             value=default_bot_token,
             help="Get this from @BotFather on Telegram.",
         )
     with tg_col2:
         chat_id = st.text_input(
-            "Chat ID (main route)",
+            "Chat ID",
             value=default_chat_id,
             help="The chat you're sending to / receiving from.",
         )
-
-    priority_chat_id = st.text_input(
-        "Priority Chat ID (optional second route)",
-        value=default_priority_chat_id,
-        help=(
-            "A second chat/channel ID to escalate to — e.g. a separate 'Alerts' chat with "
-            "your bot, or a group chat. Leave blank to only use the main chat."
-        ),
-    )
 
     keywords_input = st.text_input(
         "Important keywords (comma-separated)",
@@ -453,12 +454,6 @@ with main_col:
     )
     st.session_state.telegram_keywords = keywords_input
     important_keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
-
-    st.session_state.telegram_auto_escalate = st.checkbox(
-        "Auto-escalate: when a message is classified Important, also push it to the Priority route",
-        value=st.session_state.telegram_auto_escalate,
-        help="Requires a Priority Chat ID above. Sends a second, distinct alert through that route.",
-    )
 
     st.subheader("Send a message")
     send_col1, send_col2 = st.columns([4, 1])
@@ -481,45 +476,6 @@ with main_col:
             else:
                 st.error(f"Failed to send: {info}")
 
-    st.subheader("Push a notification")
-    notify_col1, notify_col2, notify_col3 = st.columns([2, 2, 1])
-    with notify_col1:
-        notify_type = st.selectbox(
-            "Content",
-            ["Full digest", "To-do list", "Timetable", "Important messages"],
-        )
-    with notify_col2:
-        notify_route = st.selectbox(
-            "Route",
-            ["Main chat", "Priority chat"],
-            help="Priority chat requires a Priority Chat ID above.",
-        )
-    with notify_col3:
-        st.write("")
-        st.write("")
-        notify_clicked = st.button("Send notification", use_container_width=True)
-
-    if notify_clicked:
-        target = chat_id if notify_route == "Main chat" else priority_chat_id
-        if not bot_token.strip() or not target.strip():
-            st.error(f"Missing Bot Token or the {notify_route} ID.")
-        else:
-            if notify_type == "Full digest":
-                content = tga.build_digest(st.session_state)
-            elif notify_type == "To-do list":
-                content = "✅ To-Do List\n\n" + tga.format_todos(st.session_state.todos)
-            elif notify_type == "Timetable":
-                content = "🗓️ Timetable\n\n" + tga.format_timetable(st.session_state.timetable)
-            else:
-                content = "⭐ Important Messages\n\n" + tga.format_important(
-                    st.session_state.telegram_important, limit=10
-                )
-            ok, info = send_telegram_message(bot_token.strip(), target.strip(), content)
-            if ok:
-                st.success(f"Notification sent to {notify_route}.")
-            else:
-                st.error(f"Failed to send: {info}")
-
     st.subheader("Incoming messages & questions")
     check_col1, check_col2 = st.columns([1, 3])
     with check_col1:
@@ -527,10 +483,10 @@ with main_col:
     with check_col2:
         st.caption(
             "Fetches anything sent to your bot since the last check. Messages starting with "
-            "/ask, ?, /todos, /timetable, /important, /summary, or /help are treated as "
-            "commands and answered directly back on Telegram; everything else is sorted into "
-            "Inbox or Important. Streamlit doesn't push in real time, so click this (or "
-            "refresh) to pull the latest."
+            "/ask, ?, /todos, /timetable, /important, /summary, or /help are answered directly "
+            "back on Telegram. Everything else is sorted into Inbox/Important **and** embedded "
+            "into your RAG index, so it becomes something you can later ask about. Streamlit "
+            "doesn't push in real time, so click this (or refresh) to pull the latest."
         )
 
     if check_clicked:
@@ -547,7 +503,7 @@ with main_col:
                 st.error(f"Couldn't fetch updates: {err}")
             else:
                 messages = extract_messages(updates)
-                answered, sorted_count = 0, 0
+                answered, ingested_count = 0, 0
 
                 for m in messages:
                     st.session_state.telegram_last_update_id = max(
@@ -589,20 +545,66 @@ with main_col:
                         bucket = classify_message(m["text"], important_keywords)
                         if bucket == "important":
                             st.session_state.telegram_important.append(m)
-                            if st.session_state.telegram_auto_escalate and priority_chat_id.strip():
-                                send_telegram_message(
-                                    bot_token.strip(),
-                                    priority_chat_id.strip(),
-                                    f"⚠️ Important message flagged:\n\n{m['text']}",
-                                )
                         else:
                             st.session_state.telegram_inbox.append(m)
-                        sorted_count += 1
+                        # Feed it into the RAG index too, so it's answerable later.
+                        st.session_state.vectorstore = add_text_to_index(
+                            st.session_state.vectorstore,
+                            m["text"],
+                            source_label=f"Telegram ({m['from']})",
+                        )
+                        ingested_count += 1
 
                 if messages:
-                    st.success(f"Answered {answered} command(s), sorted {sorted_count} message(s).")
+                    st.success(
+                        f"Answered {answered} command(s), ingested {ingested_count} message(s) "
+                        "into your RAG index."
+                    )
                 else:
                     st.info("No new messages.")
+
+    with st.expander("➕ Content Bot (optional) — a second bot dedicated to feeding in content"):
+        st.markdown(
+            "Useful if you want to keep 'notes/content' separate from 'questions' — e.g. forward "
+            "articles, voice notes, or clippings to a **second bot**, and everything it receives "
+            "gets embedded into the RAG index automatically (no keyword sorting, no replies — "
+            "pure ingestion). Create it the same way you made your main bot, via @BotFather."
+        )
+        default_content_bot_token = st.secrets.get(
+            "TELEGRAM_CONTENT_BOT_TOKEN", os.environ.get("TELEGRAM_CONTENT_BOT_TOKEN", "")
+        )
+        content_bot_token = st.text_input(
+            "Content Bot Token", type="password", value=default_content_bot_token, key="content_bot_token"
+        )
+        content_check_clicked = st.button("Check for new content")
+
+        if content_check_clicked:
+            if not content_bot_token.strip():
+                st.error("Add the Content Bot's token first.")
+            else:
+                offset = (
+                    st.session_state.get("content_last_update_id", 0) + 1
+                    if st.session_state.get("content_last_update_id") is not None
+                    else None
+                )
+                updates, err = get_telegram_updates(content_bot_token.strip(), offset=offset)
+                if err:
+                    st.error(f"Couldn't fetch updates: {err}")
+                else:
+                    messages = extract_messages(updates)
+                    for m in messages:
+                        st.session_state["content_last_update_id"] = max(
+                            st.session_state.get("content_last_update_id", 0) or 0, m["update_id"]
+                        )
+                        st.session_state.vectorstore = add_text_to_index(
+                            st.session_state.vectorstore,
+                            m["text"],
+                            source_label=f"Telegram Content Bot ({m['from']})",
+                        )
+                    if messages:
+                        st.success(f"Ingested {len(messages)} message(s) into your RAG index.")
+                    else:
+                        st.info("No new content.")
 
     inbox_tab, important_tab, assistant_tab = st.tabs(
         [f"📥 Inbox ({len(st.session_state.telegram_inbox)})",
