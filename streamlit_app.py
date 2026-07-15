@@ -229,26 +229,36 @@ def build_index(uploaded_files, api_key):
 
 def poll_content_bot_once(token):
     """Fetch any new messages sent to the content bot and embed them into the
-    RAG index. Returns (ingested_count, error) — error is None on success."""
-    offset = (
-        st.session_state.get("content_last_update_id", 0) + 1
-        if st.session_state.get("content_last_update_id") is not None
-        else None
-    )
-    updates, err = get_telegram_updates(token, offset=offset)
-    if err:
-        return None, err
-    messages = extract_messages(updates)
-    for m in messages:
-        st.session_state["content_last_update_id"] = max(
-            st.session_state.get("content_last_update_id", 0) or 0, m["update_id"]
+    RAG index. Returns (ingested_count, error) — error is None on success.
+    Never raises: any failure is returned as an error string instead, so a
+    background poll can't crash the app."""
+    if st.session_state.get("_content_poll_in_progress"):
+        return 0, None  # a poll is already running; skip this tick rather than stack up
+    st.session_state["_content_poll_in_progress"] = True
+    try:
+        offset = (
+            st.session_state.get("content_last_update_id", 0) + 1
+            if st.session_state.get("content_last_update_id") is not None
+            else None
         )
-        st.session_state.vectorstore = add_text_to_index(
-            st.session_state.vectorstore,
-            m["text"],
-            source_label=f"Telegram Content Bot ({m['from']})",
-        )
-    return len(messages), None
+        updates, err = get_telegram_updates(token, offset=offset)
+        if err:
+            return None, err
+        messages = extract_messages(updates)
+        for m in messages:
+            st.session_state["content_last_update_id"] = max(
+                st.session_state.get("content_last_update_id", 0) or 0, m["update_id"]
+            )
+            st.session_state.vectorstore = add_text_to_index(
+                st.session_state.vectorstore,
+                m["text"],
+                source_label=f"Telegram Content Bot ({m['from']})",
+            )
+        return len(messages), None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        st.session_state["_content_poll_in_progress"] = False
 
 
 def answer_question(vectorstore, question, api_key):
@@ -368,14 +378,17 @@ with st.sidebar:
 
     if st.button("Build Index", type="primary", disabled=not uploaded_files):
         with st.spinner("Loading files, transcribing audio if any, and building index..."):
-            vectorstore, msg, skipped = build_index(uploaded_files, api_key.strip())
-            st.session_state.vectorstore = vectorstore
-            if vectorstore is None:
-                st.error(msg)
-            else:
-                st.success(msg)
-                if skipped:
-                    st.warning(f"Skipped: {', '.join(skipped)}")
+            try:
+                vectorstore, msg, skipped = build_index(uploaded_files, api_key.strip())
+                st.session_state.vectorstore = vectorstore
+                if vectorstore is None:
+                    st.error(msg)
+                else:
+                    st.success(msg)
+                    if skipped:
+                        st.warning(f"Skipped: {', '.join(skipped)}")
+            except Exception as e:
+                st.error(f"Something went wrong while building the index: {e}")
 
 main_col, side_col = st.columns([2.4, 1], gap="large")
 
@@ -426,21 +439,27 @@ with main_col:
             st.error("No GROQ API key found. Set it in the sidebar or in Streamlit secrets (GROQ_API_KEY).")
         else:
             with st.spinner("Thinking..."):
-                answer, source_docs = answer_question(
-                    st.session_state.vectorstore, question, api_key.strip()
-                )
-            log_qa(question, answer)
+                try:
+                    answer, source_docs = answer_question(
+                        st.session_state.vectorstore, question, api_key.strip()
+                    )
+                except Exception as e:
+                    st.error(f"Something went wrong while answering: {e}")
+                    answer, source_docs = None, []
 
-            st.subheader("Answer")
-            st.write(answer)
+            if answer is not None:
+                log_qa(question, answer)
 
-            st.subheader("Sources")
-            for i, d in enumerate(source_docs, 1):
-                src = d.metadata.get("source", "unknown")
-                page = d.metadata.get("page")
-                loc = f"{src}" + (f" (page {page})" if page is not None else "")
-                with st.expander(f"[{i}] {loc}"):
-                    st.write(d.page_content[:500] + ("..." if len(d.page_content) > 500 else ""))
+                st.subheader("Answer")
+                st.write(answer)
+
+                st.subheader("Sources")
+                for i, d in enumerate(source_docs, 1):
+                    src = d.metadata.get("source", "unknown")
+                    page = d.metadata.get("page")
+                    loc = f"{src}" + (f" (page {page})" if page is not None else "")
+                    with st.expander(f"[{i}] {loc}"):
+                        st.write(d.page_content[:500] + ("..." if len(d.page_content) > 500 else ""))
 
     # -----------------------------------------------------------------------
     # 3. Telegram
@@ -527,7 +546,7 @@ with main_col:
                 st.error(f"Couldn't fetch updates: {err}")
             else:
                 messages = extract_messages(updates)
-                answered, ingested_count = 0, 0
+                answered, ingested_count, failures = 0, 0, []
 
                 for m in messages:
                     st.session_state.telegram_last_update_id = max(
@@ -535,55 +554,70 @@ with main_col:
                     )
                     reply_chat = m["chat_id"] or chat_id
 
-                    if tga.is_command(m["text"]):
-                        cmd, arg = tga.parse_command(m["text"])
-                        if cmd == "todos":
-                            reply = "✅ To-Do List\n\n" + tga.format_todos(st.session_state.todos)
-                        elif cmd == "timetable":
-                            reply = "🗓️ Timetable\n\n" + tga.format_timetable(st.session_state.timetable)
-                        elif cmd == "important":
-                            reply = "⭐ Important Messages\n\n" + tga.format_important(
-                                st.session_state.telegram_important, limit=10
-                            )
-                        elif cmd == "summary":
-                            reply = tga.build_digest(st.session_state)
-                        elif cmd == "help":
-                            reply = tga.HELP_TEXT
-                        else:  # "ask"
-                            if not api_key.strip():
-                                reply = "I can't answer that — no GROQ API key is configured."
-                            elif not arg.strip():
-                                reply = "Ask me something after /ask — e.g. `/ask what's on my schedule today?`"
+                    try:
+                        if tga.is_command(m["text"]):
+                            cmd, arg = tga.parse_command(m["text"])
+                            if cmd == "todos":
+                                reply = "✅ To-Do List\n\n" + tga.format_todos(st.session_state.todos)
+                            elif cmd == "timetable":
+                                reply = "🗓️ Timetable\n\n" + tga.format_timetable(st.session_state.timetable)
+                            elif cmd == "important":
+                                reply = "⭐ Important Messages\n\n" + tga.format_important(
+                                    st.session_state.telegram_important, limit=10
+                                )
+                            elif cmd == "summary":
+                                reply = tga.build_digest(st.session_state)
+                            elif cmd == "help":
+                                reply = tga.HELP_TEXT
+                            else:  # "ask"
+                                if not api_key.strip():
+                                    reply = "I can't answer that — no GROQ API key is configured."
+                                elif not arg.strip():
+                                    reply = "Ask me something after /ask — e.g. `/ask what's on my schedule today?`"
+                                else:
+                                    state_ctx = tga.build_state_context(st.session_state)
+                                    answer, _ = answer_unified_query(
+                                        st.session_state.vectorstore, arg, api_key.strip(), state_ctx
+                                    )
+                                    reply = answer or "(No answer was generated — try rephrasing the question.)"
+                                    st.session_state.telegram_commands.append(
+                                        {"question": arg, "answer": reply, "date": m.get("date")}
+                                    )
+
+                            # Telegram caps messages at 4096 characters.
+                            if len(reply) > 4000:
+                                reply = reply[:4000] + "\n\n[...truncated]"
+
+                            ok, info = send_telegram_message(bot_token.strip(), str(reply_chat), reply)
+                            if ok:
+                                answered += 1
                             else:
-                                state_ctx = tga.build_state_context(st.session_state)
-                                answer, _ = answer_unified_query(
-                                    st.session_state.vectorstore, arg, api_key.strip(), state_ctx
-                                )
-                                reply = answer
-                                st.session_state.telegram_commands.append(
-                                    {"question": arg, "answer": answer, "date": m.get("date")}
-                                )
-                        send_telegram_message(bot_token.strip(), str(reply_chat), reply)
-                        answered += 1
-                    else:
-                        bucket = classify_message(m["text"], important_keywords)
-                        if bucket == "important":
-                            st.session_state.telegram_important.append(m)
+                                failures.append(f"reply to \"{m['text'][:40]}\": {info}")
                         else:
-                            st.session_state.telegram_inbox.append(m)
-                        # Feed it into the RAG index too, so it's answerable later.
-                        st.session_state.vectorstore = add_text_to_index(
-                            st.session_state.vectorstore,
-                            m["text"],
-                            source_label=f"Telegram ({m['from']})",
-                        )
-                        ingested_count += 1
+                            bucket = classify_message(m["text"], important_keywords)
+                            if bucket == "important":
+                                st.session_state.telegram_important.append(m)
+                            else:
+                                st.session_state.telegram_inbox.append(m)
+                            # Feed it into the RAG index too, so it's answerable later.
+                            st.session_state.vectorstore = add_text_to_index(
+                                st.session_state.vectorstore,
+                                m["text"],
+                                source_label=f"Telegram ({m['from']})",
+                            )
+                            ingested_count += 1
+                    except Exception as e:
+                        # Never let one bad message take down the whole batch —
+                        # log it and keep processing the rest.
+                        failures.append(f"\"{m['text'][:40]}\": {e}")
 
                 if messages:
                     st.success(
                         f"Answered {answered} command(s), ingested {ingested_count} message(s) "
                         "into your RAG index."
                     )
+                    if failures:
+                        st.error("Some messages failed:\n" + "\n".join(f"- {f}" for f in failures))
                 else:
                     st.info("No new messages.")
 
@@ -606,12 +640,13 @@ with main_col:
             auto_poll = st.checkbox(
                 "Auto-check for new content",
                 key="content_auto_poll",
-                help="Polls automatically on a timer while this tab stays open.",
+                help="Polls automatically on a timer while this tab stays open. Keep the interval "
+                     "reasonably high — this app has limited resources.",
             )
         with poll_col2:
             poll_interval = st.number_input(
                 "Every N seconds",
-                min_value=10, max_value=300, value=30, step=5,
+                min_value=30, max_value=600, value=60, step=15,
                 key="content_poll_interval",
                 disabled=not auto_poll,
             )
