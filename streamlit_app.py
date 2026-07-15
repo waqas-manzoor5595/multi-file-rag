@@ -61,18 +61,25 @@ Answer:"""
 )
 
 COMBINED_PROMPT = ChatPromptTemplate.from_template(
-    """You are a personal assistant with access to the user's uploaded documents AND
-their current dashboard state (to-do list, timetable, and flagged important Telegram messages).
+    """You are a personal assistant with access to two sources: the user's dashboard state
+(to-do list, timetable, and important Telegram messages) and their uploaded/ingested documents.
 
-Use whichever is relevant to answer the question. If it's about documents, cite the source file
-by name. If it's about todos, timetable, or messages, answer directly from the dashboard state
-below. If the answer isn't in either, say so plainly rather than guessing.
+Priority rules — follow these exactly:
+1. If the question is about todos, tasks, the schedule/timetable, or "important messages",
+   answer ONLY from the Dashboard State section below. Do not search the document context for
+   these questions, even if it seems related.
+2. If the Dashboard State section relevant to the question is empty (e.g. "No important messages
+   flagged"), say so plainly — e.g. "Nothing is currently flagged as important." Do not fall back
+   to guessing from documents, and do not say you don't have access to that information — you do,
+   it's just empty right now.
+3. For everything else, answer from the Document Context, citing the source file by name.
+4. If neither source has the answer, say so plainly rather than guessing.
 
-Document context:
-{doc_context}
-
-Dashboard state:
+Dashboard State:
 {state_context}
+
+Document Context:
+{doc_context}
 
 Question: {question}
 
@@ -275,14 +282,27 @@ def poll_main_bot_once(bot_token, default_chat_id, api_key):
                         elif not arg.strip():
                             reply = "Ask me something after /ask — e.g. `/ask what's on my schedule today?`"
                         else:
-                            state_ctx = tga.build_state_context(st.session_state)
-                            answer, _ = answer_unified_query(
-                                st.session_state.vectorstore, arg, api_key.strip(), state_ctx
-                            )
-                            reply = answer or "(No answer was generated — try rephrasing the question.)"
+                            intent = tga.detect_dashboard_intent(arg)
+                            if intent == "todos":
+                                reply = "✅ To-Do List\n\n" + tga.format_todos(st.session_state.todos)
+                            elif intent == "timetable":
+                                reply = "🗓️ Timetable\n\n" + tga.format_timetable(st.session_state.timetable)
+                            elif intent == "important":
+                                reply = "⭐ Important Messages\n\n" + tga.format_important(
+                                    st.session_state.telegram_important, limit=10
+                                )
+                            elif intent == "summary":
+                                reply = tga.build_digest(st.session_state)
+                            else:
+                                state_ctx = tga.build_state_context(st.session_state)
+                                answer, _ = answer_unified_query(
+                                    st.session_state.vectorstore, arg, api_key.strip(), state_ctx
+                                )
+                                reply = answer or "(No answer was generated — try rephrasing the question.)"
                             st.session_state.telegram_commands.append(
                                 {"question": arg, "answer": reply, "date": m.get("date")}
                             )
+                            log_qa(f"[Telegram] {arg}", reply)
 
                     if len(reply) > 4000:  # Telegram caps messages at 4096 characters
                         reply = reply[:4000] + "\n\n[...truncated]"
