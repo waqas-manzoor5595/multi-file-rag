@@ -89,6 +89,49 @@ def build_state_context(session_state):
     )
 
 
+def detect_dashboard_intent(question):
+    """Best-effort detection of whether a free-form /ask question is really
+    just asking for dashboard state (todos/timetable/important/summary), so
+    it can be answered deterministically from session state instead of
+    relying on the LLM to correctly prioritize which context to use.
+    Returns one of 'todos', 'timetable', 'important', 'summary', or None
+    (None means: treat it as a real document/general question, and route
+    it through the full RAG + LLM pipeline as usual).
+
+    Important: this is a fast-path for *obvious* dashboard questions only.
+    Anything that references documents/files explicitly always falls through
+    to the LLM/RAG path, even if it also contains a dashboard-ish word —
+    e.g. "is there anything important in the contract" should still search
+    documents, not just dump the Important Messages list.
+    """
+    q = question.lower().strip()
+
+    # If the question clearly references documents/files, never shortcut —
+    # let the full RAG pipeline handle it, since that's the actual answer source.
+    document_hint_words = (
+        "document", "file", "pdf", "doc ", "report", "contract", "text",
+        "uploaded", "mentioned", "according to", "says about", "paper",
+        "article", "content", "attachment", "clause", "section",
+    )
+    if any(w in q for w in document_hint_words):
+        return None
+
+    summary_words = ("summary", "digest", "overview", "what's going on", "whats going on", "anything going on")
+    important_words = ("important", "urgent", "priority", "flagged")
+    todo_words = ("to-do", "to do", "todo", "task")
+    timetable_words = ("timetable", "schedule", "calendar", "agenda")
+
+    if any(w in q for w in summary_words):
+        return "summary"
+    if any(w in q for w in important_words):
+        return "important"
+    if any(w in q for w in todo_words):
+        return "todos"
+    if any(w in q for w in timetable_words):
+        return "timetable"
+    return None
+
+
 def build_digest(session_state):
     """A condensed, Telegram-friendly digest of everything for /summary
     and for the manual 'Send Digest' notification button."""
