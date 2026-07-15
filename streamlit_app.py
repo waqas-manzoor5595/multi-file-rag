@@ -618,7 +618,7 @@ with main_col:
     with auto_col2:
         main_poll_interval = st.number_input(
             "Every N seconds",
-            min_value=15, max_value=300, value=30, step=5,
+            min_value=10, max_value=300, value=10, step=5,
             key="main_poll_interval",
             disabled=not main_auto_poll,
         )
@@ -705,13 +705,12 @@ with main_col:
             auto_poll = st.checkbox(
                 "Auto-check for new content",
                 key="content_auto_poll",
-                help="Polls automatically on a timer while this tab stays open. Keep the interval "
-                     "reasonably high — this app has limited resources.",
+                help="Polls automatically on a timer while this tab stays open.",
             )
         with poll_col2:
             poll_interval = st.number_input(
                 "Every N seconds",
-                min_value=30, max_value=600, value=60, step=15,
+                min_value=10, max_value=600, value=10, step=5,
                 key="content_poll_interval",
                 disabled=not auto_poll,
             )
