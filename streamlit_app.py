@@ -227,10 +227,11 @@ def build_index(uploaded_files, api_key):
     return vectorstore, msg, skipped
 
 
-def poll_main_bot_once(bot_token, default_chat_id, api_key, important_keywords):
+def poll_main_bot_once(bot_token, default_chat_id, api_key):
     """Fetch new messages for the main bot: answer commands (/ask, /todos, etc.)
-    directly on Telegram, and sort/ingest everything else. Returns
-    (answered, ingested_count, failures, error). Never raises."""
+    directly on Telegram, and embed everything else straight into the RAG
+    index (no Inbox/Important sorting — that's the Content Bot's job).
+    Returns (answered, ingested_count, failures, error). Never raises."""
     if st.session_state.get("_main_poll_in_progress"):
         return 0, 0, [], None
     st.session_state["_main_poll_in_progress"] = True
@@ -292,11 +293,6 @@ def poll_main_bot_once(bot_token, default_chat_id, api_key, important_keywords):
                     else:
                         failures.append(f"reply to \"{m['text'][:40]}\": {info}")
                 else:
-                    bucket = classify_message(m["text"], important_keywords)
-                    if bucket == "important":
-                        st.session_state.telegram_important.append(m)
-                    else:
-                        st.session_state.telegram_inbox.append(m)
                     st.session_state.vectorstore = add_text_to_index(
                         st.session_state.vectorstore, m["text"], source_label=f"Telegram ({m['from']})"
                     )
@@ -311,9 +307,10 @@ def poll_main_bot_once(bot_token, default_chat_id, api_key, important_keywords):
         st.session_state["_main_poll_in_progress"] = False
 
 
-def poll_content_bot_once(token):
-    """Fetch any new messages sent to the content bot and embed them into the
-    RAG index. Returns (ingested_count, error) — error is None on success.
+def poll_content_bot_once(token, important_keywords):
+    """Fetch any new messages sent to the content bot, sort each into
+    Inbox/Important based on keywords, and embed them into the RAG index.
+    Returns (ingested_count, error) — error is None on success.
     Never raises: any failure is returned as an error string instead, so a
     background poll can't crash the app."""
     if st.session_state.get("_content_poll_in_progress"):
@@ -333,6 +330,11 @@ def poll_content_bot_once(token):
             st.session_state["content_last_update_id"] = max(
                 st.session_state.get("content_last_update_id", 0) or 0, m["update_id"]
             )
+            bucket = classify_message(m["text"], important_keywords)
+            if bucket == "important":
+                st.session_state.telegram_important.append(m)
+            else:
+                st.session_state.telegram_inbox.append(m)
             st.session_state.vectorstore = add_text_to_index(
                 st.session_state.vectorstore,
                 m["text"],
@@ -425,7 +427,7 @@ if "telegram_important" not in st.session_state:
 if "telegram_last_update_id" not in st.session_state:
     st.session_state.telegram_last_update_id = None
 if "telegram_keywords" not in st.session_state:
-    st.session_state.telegram_keywords = "urgent, asap, important"
+    st.session_state.telegram_keywords = "cricket, sports, research"
 if "telegram_commands" not in st.session_state:
     st.session_state.telegram_commands = []  # log of {question, answer} pairs asked via Telegram
 
@@ -629,8 +631,9 @@ with main_col:
     with check_col2:
         st.caption(
             "Messages starting with /ask, ?, /todos, /timetable, /important, /summary, or /help "
-            "are answered directly back on Telegram. Everything else is sorted into Inbox/Important "
-            "**and** embedded into your RAG index, so it becomes something you can later ask about."
+            "are answered directly back on Telegram. Everything else is embedded straight into "
+            "your RAG index (no Inbox/Important sorting here — that's what the Content Bot below "
+            "is for)."
         )
 
     if check_clicked:
@@ -638,7 +641,7 @@ with main_col:
             st.error("Add your Bot Token first.")
         else:
             answered, ingested_count, failures, poll_err = poll_main_bot_once(
-                bot_token.strip(), chat_id.strip(), api_key, important_keywords
+                bot_token.strip(), chat_id.strip(), api_key
             )
             if poll_err:
                 st.error(f"Couldn't fetch updates: {poll_err}")
@@ -661,13 +664,10 @@ with main_col:
                 token = st.session_state.get("main_bot_token", "").strip()
                 default_chat = st.session_state.get("main_chat_id", "").strip()
                 key = st.session_state.get("groq_api_key", "").strip()
-                keywords = [
-                    k.strip() for k in st.session_state.get("telegram_keywords", "").split(",") if k.strip()
-                ]
                 if not token:
                     return
                 answered, ingested_count, failures, poll_err = poll_main_bot_once(
-                    token, default_chat, key, keywords
+                    token, default_chat, key
                 )
                 ts = datetime.now().strftime("%H:%M:%S")
                 if poll_err:
@@ -689,9 +689,10 @@ with main_col:
     with st.expander("➕ Content Bot (optional) — a second bot dedicated to feeding in content", expanded=True):
         st.markdown(
             "Useful if you want to keep 'notes/content' separate from 'questions' — e.g. forward "
-            "articles, voice notes, or clippings to a **second bot**, and everything it receives "
-            "gets embedded into the RAG index automatically (no keyword sorting, no replies — "
-            "pure ingestion). Create it the same way you made your main bot, via @BotFather."
+            "articles, voice notes, or clippings to a **second bot**. Everything it receives is "
+            "sorted into **Inbox** or **Important** (based on your keywords above) and embedded "
+            "into the RAG index — no replies, pure intake. Create it the same way you made your "
+            "main bot, via @BotFather."
         )
         default_content_bot_token = st.secrets.get(
             "TELEGRAM_CONTENT_BOT_TOKEN", os.environ.get("TELEGRAM_CONTENT_BOT_TOKEN", "")
@@ -720,11 +721,11 @@ with main_col:
             if not content_bot_token.strip():
                 st.error("Add the Content Bot's token first.")
             else:
-                count, err = poll_content_bot_once(content_bot_token.strip())
+                count, err = poll_content_bot_once(content_bot_token.strip(), important_keywords)
                 if err:
                     st.error(f"Couldn't fetch updates: {err}")
                 elif count:
-                    st.success(f"Ingested {count} message(s) into your RAG index.")
+                    st.success(f"Sorted and ingested {count} message(s).")
                 else:
                     st.info("No new content.")
 
@@ -737,12 +738,15 @@ with main_col:
                     token = st.session_state.get("content_bot_token", "").strip()
                     if not token:
                         return
-                    count, err = poll_content_bot_once(token)
+                    keywords = [
+                        k.strip() for k in st.session_state.get("telegram_keywords", "").split(",") if k.strip()
+                    ]
+                    count, err = poll_content_bot_once(token, keywords)
                     ts = datetime.now().strftime("%H:%M:%S")
                     if err:
                         st.caption(f"⚠️ [{ts}] Poll failed: {err}")
                     else:
-                        st.caption(f"🔄 [{ts}] Checked — ingested {count} new message(s).")
+                        st.caption(f"🔄 [{ts}] Checked — sorted and ingested {count} new message(s).")
 
                 _content_bot_autopoll()
 
