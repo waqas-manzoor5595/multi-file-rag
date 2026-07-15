@@ -227,6 +227,30 @@ def build_index(uploaded_files, api_key):
     return vectorstore, msg, skipped
 
 
+def poll_content_bot_once(token):
+    """Fetch any new messages sent to the content bot and embed them into the
+    RAG index. Returns (ingested_count, error) — error is None on success."""
+    offset = (
+        st.session_state.get("content_last_update_id", 0) + 1
+        if st.session_state.get("content_last_update_id") is not None
+        else None
+    )
+    updates, err = get_telegram_updates(token, offset=offset)
+    if err:
+        return None, err
+    messages = extract_messages(updates)
+    for m in messages:
+        st.session_state["content_last_update_id"] = max(
+            st.session_state.get("content_last_update_id", 0) or 0, m["update_id"]
+        )
+        st.session_state.vectorstore = add_text_to_index(
+            st.session_state.vectorstore,
+            m["text"],
+            source_label=f"Telegram Content Bot ({m['from']})",
+        )
+    return len(messages), None
+
+
 def answer_question(vectorstore, question, api_key):
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=api_key)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -563,7 +587,7 @@ with main_col:
                 else:
                     st.info("No new messages.")
 
-    with st.expander("➕ Content Bot (optional) — a second bot dedicated to feeding in content"):
+    with st.expander("➕ Content Bot (optional) — a second bot dedicated to feeding in content", expanded=True):
         st.markdown(
             "Useful if you want to keep 'notes/content' separate from 'questions' — e.g. forward "
             "articles, voice notes, or clippings to a **second bot**, and everything it receives "
@@ -576,35 +600,58 @@ with main_col:
         content_bot_token = st.text_input(
             "Content Bot Token", type="password", value=default_content_bot_token, key="content_bot_token"
         )
-        content_check_clicked = st.button("Check for new content")
 
-        if content_check_clicked:
+        poll_col1, poll_col2 = st.columns([1, 1])
+        with poll_col1:
+            auto_poll = st.checkbox(
+                "Auto-check for new content",
+                key="content_auto_poll",
+                help="Polls automatically on a timer while this tab stays open.",
+            )
+        with poll_col2:
+            poll_interval = st.number_input(
+                "Every N seconds",
+                min_value=10, max_value=300, value=30, step=5,
+                key="content_poll_interval",
+                disabled=not auto_poll,
+            )
+
+        manual_clicked = st.button("Check for new content now")
+        if manual_clicked:
             if not content_bot_token.strip():
                 st.error("Add the Content Bot's token first.")
             else:
-                offset = (
-                    st.session_state.get("content_last_update_id", 0) + 1
-                    if st.session_state.get("content_last_update_id") is not None
-                    else None
-                )
-                updates, err = get_telegram_updates(content_bot_token.strip(), offset=offset)
+                count, err = poll_content_bot_once(content_bot_token.strip())
                 if err:
                     st.error(f"Couldn't fetch updates: {err}")
+                elif count:
+                    st.success(f"Ingested {count} message(s) into your RAG index.")
                 else:
-                    messages = extract_messages(updates)
-                    for m in messages:
-                        st.session_state["content_last_update_id"] = max(
-                            st.session_state.get("content_last_update_id", 0) or 0, m["update_id"]
-                        )
-                        st.session_state.vectorstore = add_text_to_index(
-                            st.session_state.vectorstore,
-                            m["text"],
-                            source_label=f"Telegram Content Bot ({m['from']})",
-                        )
-                    if messages:
-                        st.success(f"Ingested {len(messages)} message(s) into your RAG index.")
+                    st.info("No new content.")
+
+        if auto_poll:
+            if not content_bot_token.strip():
+                st.warning("Add a Content Bot token above to enable auto-polling.")
+            else:
+                @st.fragment(run_every=poll_interval)
+                def _content_bot_autopoll():
+                    token = st.session_state.get("content_bot_token", "").strip()
+                    if not token:
+                        return
+                    count, err = poll_content_bot_once(token)
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    if err:
+                        st.caption(f"⚠️ [{ts}] Poll failed: {err}")
                     else:
-                        st.info("No new content.")
+                        st.caption(f"🔄 [{ts}] Checked — ingested {count} new message(s).")
+
+                _content_bot_autopoll()
+
+            st.caption(
+                "Note: auto-polling only runs while this app is open in a browser tab (and not "
+                "asleep — e.g. Streamlit Community Cloud's free tier idles apps with no traffic). "
+                "It's not a 24/7 background service; leave a tab open for it to keep working."
+            )
 
     inbox_tab, important_tab, assistant_tab = st.tabs(
         [f"📥 Inbox ({len(st.session_state.telegram_inbox)})",
@@ -700,4 +747,3 @@ with side_col:
 
             if done:
                 st.caption(f"{len(done)}/{len(st.session_state.todos)} completed")
-
